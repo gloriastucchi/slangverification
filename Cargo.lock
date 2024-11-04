@@ -1607,6 +1607,7 @@ name = "slang-template"
 version = "0.1.0"
 dependencies = [
  "datatest-stable",
+ "eyre",
  "itertools 0.13.0",
  "regex",
  "slang-ui",

@@ -1,81 +1,203 @@
-pub mod ivl;
+mod ivl;
 mod ivl_ext;
 
 use ivl::{IVLCmd, IVLCmdKind};
-use slang::ast::{Cmd, CmdKind, Expr};
+use crate::slang::ast::{Cmd, CmdKind, Expr, PrefixOp, ExprKind, Cases};
+use crate::slang::Span;
 use slang_ui::prelude::*;
+use std::collections::HashSet;
 
 pub struct App;
 
 impl slang_ui::Hook for App {
     fn analyze(&self, cx: &mut slang_ui::Context, file: &slang::SourceFile) -> Result<()> {
-        // Get reference to Z3 solver
         let mut solver = cx.solver()?;
 
-        // Iterate methods
         for m in file.methods() {
-            // Get method's preconditions;
             let pres = m.requires();
-            // Merge them into a single condition
-            let pre = pres
-                .cloned()
-                .reduce(|a, b| a & b)
-                .unwrap_or(Expr::bool(true));
-            // Convert the expression into an SMT expression
+            let pre = pres.cloned().reduce(|a, b| a & b).unwrap_or(Expr::bool(true));
             let spre = pre.smt()?;
-            // Assert precondition
             solver.assert(spre.as_bool()?)?;
 
-            // Get method's body
             let cmd = &m.body.clone().unwrap().cmd;
-            // Encode it in IVL
             let ivl = cmd_to_ivlcmd(cmd)?;
-            // Calculate obligation and error message (if obligation is not
-            // verified)
-            let (oblig, msg) = wp(&ivl, &Expr::bool(true))?;
-            // Convert obligation to SMT expression
-            let soblig = oblig.smt()?;
 
-            // Run the following solver-related statements in a closed scope.
-            // That is, after exiting the scope, all assertions are forgotten
-            // from subsequent executions of the solver
-            solver.scope(|solver| {
-                // Check validity of obligation
-                solver.assert(!soblig.as_bool()?)?;
-                // Run SMT solver on all current assertions
-                match solver.check_sat()? {
-                    // If the obligations result not valid, report the error (on
-                    // the span in which the error happens)
-                    smtlib::SatResult::Sat => {
-                        cx.error(oblig.span, format!("{msg}"));
+            let posts = m.ensures();
+            let mut post: Vec<(Expr, String)> = posts
+                .cloned()
+                .map(|expr| (
+                    expr.clone(),
+                    format!("Error ensuring the property {}", expr),
+                ))
+                .collect();
+            
+            if post.is_empty() {
+                post.push((Expr::bool(true), "Default post condition".to_string()));
+            }
+            
+            let post_correct_spans: Vec<(Expr, String)> = post
+                .into_iter()
+                .map(|(expr, msg)| (expr, msg))
+                .collect();
+            
+            let oblig = wp(&ivl, post_correct_spans)?;
+
+            let mut stop = false;
+            for i in 0..oblig.len() {
+                if stop { break; }
+                solver.scope(|solver| {
+                    let mut or_oblig = Expr::bool(false);
+                    let mut last_obl = Expr::bool(false); 
+                    let mut last_msg = String::new();
+                    for (obl, msg) in oblig[0..=i].iter() {
+                        or_oblig = or_oblig.or(&obl.prefix(PrefixOp::Not));
+                        last_obl.span = obl.span.clone();
+                        last_msg = msg.clone();
                     }
-                    smtlib::SatResult::Unknown => {
-                        cx.warning(oblig.span, "{msg}: unknown sat result");
+                    if let Ok(soblig) = or_oblig.smt() { 
+                        solver.assert(soblig.as_bool()?)?;
+                        match solver.check_sat()? {
+                            smtlib::SatResult::Sat => {
+                                cx.error(last_obl.span, format!("Verification failed: {last_msg}."));
+                                stop = true;
+                            }
+                            smtlib::SatResult::Unknown => {
+                                cx.warning(last_obl.span, format!("Verification uncertain for: {last_msg}. Unknown SAT result."));
+                            }
+                            smtlib::SatResult::Unsat => (),
+                        }
+                    } else {
+                        println!("Failed with {:#?}", or_oblig);
                     }
-                    smtlib::SatResult::Unsat => (),
-                }
-                Ok(())
-            })?;
+                    Ok(())
+                })?;
+            }
         }
-
         Ok(())
     }
 }
 
-// Encoding of (assert-only) statements into IVL (for programs comprised of only
-// a single assertion)
+// Convert a command to IVL command representation with invariant handling for loops
 fn cmd_to_ivlcmd(cmd: &Cmd) -> Result<IVLCmd> {
     match &cmd.kind {
         CmdKind::Assert { condition, .. } => Ok(IVLCmd::assert(condition, "Assert might fail!")),
+        CmdKind::Seq(cmd1, cmd2) => Ok(IVLCmd::seq(&cmd_to_ivlcmd(cmd1)?, &cmd_to_ivlcmd(cmd2)?)),
+        CmdKind::VarDefinition { name, ty, expr } => { 
+            if let Some(expr) = expr {
+                Ok(IVLCmd::assign(name, expr))
+            } else {
+                Ok(IVLCmd::nop())
+            }
+        },
+        CmdKind::Assignment { name, expr } => Ok(IVLCmd::assign(name, expr)),
+        CmdKind::Assume { condition } => Ok(IVLCmd::assume(condition)),
+        
+        // Handling for loops with invariants treated as assertions
+        CmdKind::Loop { invariants, variant, body } => {
+            let cases_ivl: Vec<IVLCmd> = body.cases.iter()
+                .map(|case| {
+                    let case_cmd = Cmd::seq(&Cmd::assume(&case.condition), &case.cmd);
+                    cmd_to_ivlcmd(&case_cmd)
+                })
+                .collect::<Result<Vec<_>>>()?;
+            let body_ivl = IVLCmd::nondets(&cases_ivl);
+
+            Ok(IVLCmd::_loop(invariants, variant, &body_ivl))
+        },
+        
+        CmdKind::Return { expr } => {
+            let mut ivl_cmd = IVLCmd::_return(expr);
+            ivl_cmd.span = cmd.span;
+            Ok(ivl_cmd)
+        },
+        _ => todo!(" Not supported (yet)."),
+    }
+}
+
+// Weakest precondition function (WP) with adjusted invariant checks
+fn wp<'a>(ivl: &IVLCmd, mut post: Vec<(Expr, String)>) -> Result<Vec<(Expr, String)>> {
+    match &ivl.kind {
+        IVLCmdKind::Assert { condition, message } => {
+            post.push((condition.clone(), message.clone()));
+            Ok(post)
+        }
+        IVLCmdKind::Assume { condition } => {
+            let mut new_post = Vec::new();
+            for (post_expr, msg) in post.iter() {
+                new_post.push((condition.imp(post_expr), msg.clone()));
+            }
+            Ok(new_post)
+        }
+        IVLCmdKind::Seq(cmd1, cmd2) => {
+            let post2 = wp(cmd2, post)?;
+            let post1 = wp(cmd1, post2)?;
+            Ok(post1)
+        }
+        IVLCmdKind::Assignment { name, expr } => {
+            let mut new_post = Vec::new();
+            for (post_expr, msg) in post.iter() {
+                let new_expr = fix_span(expr.clone(), post_expr.span.clone());
+                new_post.push((post_expr.clone().subst(|x| x.is_ident(&name.ident), &new_expr), msg.to_string()));
+            }
+            Ok(new_post)
+        }
+        
+        IVLCmdKind::Loop { invariants, variant, body } => {
+            let mut loop_obligations = Vec::new();
+
+            // Check that invariants hold before entering the loop
+            for invariant in invariants {
+                loop_obligations.push((
+                    invariant.clone(),
+                    "Loop invariant does not hold at start".to_string(),
+                ));
+            }
+
+            let body_obligations = wp(body, invariants.clone()
+                .into_iter()
+                .map(|inv| (inv.clone(), "Loop invariant might not hold after iteration".to_string()))
+                .collect())?;
+
+            loop_obligations.extend(body_obligations);
+
+            // Ensure that invariants hold after loop terminates
+            for invariant in invariants {
+                loop_obligations.push((
+                    invariant.clone(),
+                    "Loop invariant does not hold after loop".to_string(),
+                ));
+            }
+
+            Ok(loop_obligations)
+        }
+        
+        IVLCmdKind::NonDet(cmd1, cmd2) => {
+            let mut post1 = wp(cmd1, post.clone())?;
+            let post2 = wp(cmd2, post)?;
+            post1.extend(post2);
+            Ok(post1)
+        }
+        
+        IVLCmdKind::Return { expr } => {
+            if let Some(acc_expr) = expr {
+                let mut new_post = Vec::new();
+                for (post_expr, msg) in post.iter() {
+                    let new_acc_expr = fix_span(acc_expr.clone(), post_expr.span.clone());
+                    new_post.push((post_expr.clone().subst(|x| matches!(x.kind, ExprKind::Result), &new_acc_expr), msg.to_string()));
+                }
+                Ok(new_post)
+            } else {
+                Ok(post)
+            }
+        }
         _ => todo!("Not supported (yet)."),
     }
 }
 
-// Weakest precondition of (assert-only) IVL programs comprised of a single
-// assertion
-fn wp(ivl: &IVLCmd, _: &Expr) -> Result<(Expr, String)> {
-    match &ivl.kind {
-        IVLCmdKind::Assert { condition, message } => Ok((condition.clone(), message.clone())),
-        _ => todo!("Not supported (yet)."),
+// Adjust span of expressions for error reporting
+fn fix_span(mut expr_in: Expr, span: Span) -> Expr {
+    match &expr_in.kind {
+        ExprKind::Infix(e1, op, e2) => Expr::op(&fix_span(*e1.clone(), span), *op, &fix_span(*e2.clone(), span)),
+        _ => { expr_in.span = span.clone(); expr_in }
     }
 }
