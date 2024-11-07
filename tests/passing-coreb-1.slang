@@ -1,3 +1,4 @@
+// passing-coreb-1
 method sumn(n: Int): Int
     requires n >= 0
     ensures result == n * (n + 1) / 2

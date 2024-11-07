@@ -2,10 +2,9 @@ mod ivl;
 mod ivl_ext;
 
 use ivl::{IVLCmd, IVLCmdKind};
-use crate::slang::ast::{Cmd, CmdKind, Expr, PrefixOp, ExprKind, Cases};
+use crate::slang::ast::{Cmd, CmdKind, Expr, PrefixOp, ExprKind, Type, Range};
 use crate::slang::Span;
 use slang_ui::prelude::*;
-use std::collections::HashSet;
 
 pub struct App;
 
@@ -91,9 +90,26 @@ fn cmd_to_ivlcmd(cmd: &Cmd) -> Result<IVLCmd> {
         },
         CmdKind::Assignment { name, expr } => Ok(IVLCmd::assign(name, expr)),
         CmdKind::Assume { condition } => Ok(IVLCmd::assume(condition)),
+
+        // Handle bounded for-loops by unrolling them
+        CmdKind::For { name, range, body, invariants: _, variant: _ } => {
+            if let Some((start, end)) = extract_constant_range(range) {
+                let mut ivl_cmds = Vec::new();
+
+                for i in start..end {
+                    let index_expr = Expr::new_typed(ExprKind::Num(i), Type::Int);
+                    ivl_cmds.push(IVLCmd::assign(name, &index_expr));
+                    
+                    ivl_cmds.push(cmd_to_ivlcmd(&body.cmd)?);
+                }
+
+                Ok(ivl_cmds.into_iter().reduce(|acc, cmd| IVLCmd::seq(&acc, &cmd)).unwrap_or(IVLCmd::nop()))
+            } else {
+                Err(eyre::eyre!("Expected a constant range in for-loop"))
+            }
+        },
         
-        // Handling for loops with invariants treated as assertions
-        CmdKind::Loop { invariants, variant, body } => {
+        CmdKind::Loop { invariants, variant: _, body } => {
             let cases_ivl: Vec<IVLCmd> = body.cases.iter()
                 .map(|case| {
                     let case_cmd = Cmd::seq(&Cmd::assume(&case.condition), &case.cmd);
@@ -102,9 +118,9 @@ fn cmd_to_ivlcmd(cmd: &Cmd) -> Result<IVLCmd> {
                 .collect::<Result<Vec<_>>>()?;
             let body_ivl = IVLCmd::nondets(&cases_ivl);
 
-            Ok(IVLCmd::_loop(invariants, variant, &body_ivl))
+            Ok(IVLCmd::_loop(invariants, &None, &body_ivl))
         },
-        
+
         CmdKind::Return { expr } => {
             let mut ivl_cmd = IVLCmd::_return(expr);
             ivl_cmd.span = cmd.span;
@@ -113,6 +129,19 @@ fn cmd_to_ivlcmd(cmd: &Cmd) -> Result<IVLCmd> {
         _ => todo!(" Not supported (yet)."),
     }
 }
+
+// Helper function to extract constant range values
+fn extract_constant_range(range: &Range) -> Option<(i64, i64)> {
+    if let Range::FromTo(from, to) = range {
+        if let (ExprKind::Num(start_val), ExprKind::Num(end_val)) = (&from.kind, &to.kind) {
+            // Dereference `start_val` and `end_val` to get `i64`
+            return Some((*start_val, *end_val));
+        }
+    }
+    None
+}
+
+
 
 // Weakest precondition function (WP) with adjusted invariant checks
 fn wp<'a>(ivl: &IVLCmd, mut post: Vec<(Expr, String)>) -> Result<Vec<(Expr, String)>> {
@@ -142,7 +171,7 @@ fn wp<'a>(ivl: &IVLCmd, mut post: Vec<(Expr, String)>) -> Result<Vec<(Expr, Stri
             Ok(new_post)
         }
         
-        IVLCmdKind::Loop { invariants, variant, body } => {
+        IVLCmdKind::Loop { invariants, variant: _, body } => {
             let mut loop_obligations = Vec::new();
 
             // Check that invariants hold before entering the loop

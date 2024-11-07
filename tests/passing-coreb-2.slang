@@ -1,3 +1,4 @@
+// passing-coreb-2
 method count_up_to_n(n: Int): Int
     requires n >= 0
     ensures result == n

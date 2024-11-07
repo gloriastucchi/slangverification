@@ -14,6 +14,10 @@ impl IVLCmd {
             },
         }
     }
+    
+    pub fn seqs(cmds: &[IVLCmd]) -> IVLCmd {
+        cmds.iter().cloned().reduce(|acc, cmd| acc.seq(&cmd)).unwrap_or_else(IVLCmd::nop)
+    }
 
     pub fn seq(&self, other: &IVLCmd) -> IVLCmd {
         IVLCmd {
