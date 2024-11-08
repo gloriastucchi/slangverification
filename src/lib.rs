@@ -147,9 +147,11 @@ fn extract_constant_range(range: &Range) -> Option<(i64, i64)> {
 fn wp<'a>(ivl: &IVLCmd, mut post: Vec<(Expr, String)>) -> Result<Vec<(Expr, String)>> {
     match &ivl.kind {
         IVLCmdKind::Assert { condition, message } => {
+            println!("Evaluating assertion with condition: {:?}", condition);
             post.push((condition.clone(), message.clone()));
             Ok(post)
         }
+        
         IVLCmdKind::Assume { condition } => {
             let mut new_post = Vec::new();
             for (post_expr, msg) in post.iter() {
